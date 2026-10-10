@@ -1,0 +1,59 @@
+name: Vigia externo
+
+# Homem-morto do servidor magalu: confere de fora se o vigia interno
+# (health-sentinel, a cada 5 min) continua batendo o pulso.
+
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write   # só para o passo que impede o GitHub de desligar o agendamento
+
+concurrency:
+  group: vigia
+  cancel-in-progress: true
+
+jobs:
+  pulso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Conferir o pulso
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          URL: https://plantoes.mnrs.com.br/_vigia
+        run: |
+          beat=""
+          for i in 1 2 3; do
+            beat="$(curl -fsS -m 15 "$URL" 2>/dev/null | tr -dc '0-9' || true)"
+            [ -n "$beat" ] && break
+            sleep 25
+          done
+          now=$(date +%s)
+          msg=""
+          if [ -z "$beat" ]; then
+            msg="🔴 *Servidor magalu não responde de fora* — $URL falhou 3 vezes em 1 min. Todos os sites devem estar fora (VPS, rede, cloudflared ou nginx).
+          Ação: console da Magalu Cloud para ver se a VM está de pé; se estiver, \`ssh magalu\` e \`systemctl status nginx cloudflared\`.
+          🛰 vigia externo (GitHub) · repete a cada 15 min enquanto durar"
+          elif [ $((now - beat)) -gt 1200 ]; then
+            msg="🔴 *Vigia interno do magalu parou há $(( (now - beat) / 60 )) min* — os sites respondem, mas ninguém está conferindo banco, disco e backups.
+          Ação: \`ssh magalu sudo systemctl status health-sentinel.timer\` e \`sudo journalctl -u health-sentinel -n 30\`.
+          🛰 vigia externo (GitHub) · repete a cada 15 min enquanto durar"
+          fi
+          if [ -n "$msg" ]; then
+            echo "ALERTA"
+            curl -fsS -m 15 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" -d parse_mode=Markdown --data-urlencode text="$msg" >/dev/null
+            exit 1
+          fi
+          echo "pulso ok, idade $((now - beat))s"
+
+      # O GitHub desliga agendamentos de repositório sem atividade por 60 dias.
+      - name: Manter o agendamento ativo
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/vigia.yml/enable" || true
